@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 from base64 import urlsafe_b64encode
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # -----------------------------
 # 📁 JSON File Handling
@@ -80,6 +80,10 @@ if "current_user" not in st.session_state:
     st.session_state.current_user = None
 if "page" not in st.session_state:
     st.session_state.page = "Login"
+if "lockout_time" not in st.session_state:
+    st.session_state.lockout_time = None
+if "retrieve_attempts" not in st.session_state:
+    st.session_state.retrieve_attempts = {}
 
 # -----------------------------
 # 🔑 Utility Functions
@@ -114,6 +118,16 @@ if not st.session_state.is_logged_in:
         pass_login = st.text_input("🔑 Password", type="password")
 
         if st.button("🔓 Login"):
+            user_lock_info = locks.get(user_login, {"attempts": 0, "lock_time": None})
+            if user_lock_info["lock_time"]:
+                locked_until = datetime.strptime(user_lock_info["lock_time"], "%Y-%m-%d %H:%M:%S")
+                if datetime.now() < locked_until:
+                    remaining = (locked_until - datetime.now()).seconds
+                    st.error(f"⏳ Account locked! Try again in {remaining} seconds.")
+                    st.stop()
+                else:
+                    user_lock_info = {"attempts": 0, "lock_time": None}
+
             hashed_input = hash_passkey(pass_login)
             if users_data.get(user_login) == hashed_input:
                 st.session_state.is_logged_in = True
@@ -122,9 +136,19 @@ if not st.session_state.is_logged_in:
                 st.balloons()
                 time.sleep(2)
                 st.session_state.page = "home"
+                locks[user_login] = {"attempts": 0, "lock_time": None}
+                save_locks(locks)
                 st.rerun()
             else:
-                st.error("❌ Incorrect username or password.")
+                user_lock_info["attempts"] += 1
+                if user_lock_info["attempts"] >= 3:
+                    lock_time = datetime.now() + timedelta(seconds=60)
+                    user_lock_info["lock_time"] = lock_time.strftime("%Y-%m-%d %H:%M:%S")
+                    st.error("🛑 Too many failed attempts. Account locked for 60 seconds.")
+                else:
+                    st.error("❌ Incorrect username or password.")
+                locks[user_login] = user_lock_info
+                save_locks(locks)
 
     elif auth_tab == "Register":
         st.subheader("💊 Create New Account")
@@ -148,7 +172,7 @@ if not st.session_state.is_logged_in:
 # -----------------------------
 # 🧱 Main Navigation
 # -----------------------------
-menu = ["Home", "Store Data", "Retrieve Data", "Change Password", "Delete Profile", "Logout"]
+menu = ["Home", "Store Data", "Retrieve Data", "Download data", "Change Password", "Delete Profile", "Logout"]
 choice = st.sidebar.selectbox("Navigate", menu)
 
 if choice == "Home":
@@ -191,7 +215,15 @@ elif choice == "Retrieve Data":
         selected_title = st.selectbox("📁 Select a Title to Decrypt", list(user_entries.keys()))
         passkey_input = st.text_input("🔑 Enter Passkey:", type="password")
 
-        if st.button("🤩 Decrypt"):
+        if username not in st.session_state.retrieve_attempts:
+            st.session_state.retrieve_attempts[username] = {"count": 0, "lock_until": None}
+
+        lock_info = st.session_state.retrieve_attempts[username]
+        now = datetime.now()
+        if lock_info["lock_until"] and now < lock_info["lock_until"]:
+            remaining = int((lock_info["lock_until"] - now).total_seconds())
+            st.warning(f"⏳ Locked out due to failed attempts. Try again in {remaining} seconds.")
+        elif st.button("🤩 Decrypt"):
             entry = user_entries.get(selected_title)
             if entry and entry["passkey"] == hash_passkey(passkey_input):
                 decrypted = decrypt_data(entry["encrypted"], passkey_input)
@@ -199,12 +231,35 @@ elif choice == "Retrieve Data":
                     st.success("✅ Decrypted Data:")
                     st.code(decrypted, language="text")
                     st.balloons()
+                    st.session_state.retrieve_attempts[username] = {"count": 0, "lock_until": None}
                 else:
                     st.error("❌ Failed to decrypt. Try again.")
             else:
-                st.error("❌ Incorrect passkey.")
+                lock_info["count"] += 1
+                if lock_info["count"] >= 3:
+                    lock_info["lock_until"] = now + timedelta(seconds=60)
+                    st.error("🛑 Too many failed attempts. Locked for 60 seconds.")
+                else:
+                    st.error("❌ Incorrect passkey.")
+                st.session_state.retrieve_attempts[username] = lock_info
     else:
         st.info("ℹ️ You have no saved data yet.")
+
+elif choice == "Download data":
+    st.subheader("📥 Download Your Encrypted Data")
+    user = st.session_state.current_user
+    user_data = stored_data.get(user, {})
+
+    if user_data:
+        data_text = json.dumps(user_data, indent=4)
+        st.download_button(
+            label="⬇️ Download as JSON",
+            data=data_text,
+            file_name=f"{user}_encrypted_data.json",
+            mime="application/json"
+        )
+    else:
+        st.info("📬 No data available to download.")
 
 elif choice == "Change Password":
     st.subheader("🔑 Change Password")
@@ -230,8 +285,10 @@ elif choice == "Delete Profile":
         if users_data.get(user) == hash_passkey(delete_pass):
             del users_data[user]
             st.session_state.stored_data.pop(user, None)
+            locks.pop(user, None)  # 🔐 Remove lock info
             save_users(users_data)
             save_data(st.session_state.stored_data)
+            save_locks(locks)  # 📂 Save updated lock info
             st.session_state.is_logged_in = False
             st.session_state.current_user = None
             st.success("✅ Your profile has been deleted.")
